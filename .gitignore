@@ -1,0 +1,7 @@
+# Dataset files: CT volumes, segmentation masks and predictions
+*.nii
+*.nii.gz
+*.mha
+*.mhd
+*.nrrd
+*.dcm
