@@ -5,3 +5,4 @@
 *.mhd
 *.nrrd
 *.dcm
+.venv

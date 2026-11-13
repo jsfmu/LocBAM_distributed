@@ -56,7 +56,7 @@ import torch.nn as nn
 from monai.networks.nets import BasicUNet
 import torch.nn.functional as F
 import math
-from config import Norm2d, Upsample, cfg   # check the directory
+from .config import Norm2d, Upsample, cfg   # check the directory
 from monai.networks.blocks import Convolution
 
 
