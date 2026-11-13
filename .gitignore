@@ -6,3 +6,5 @@
 *.nrrd
 *.dcm
 .venv
+__pycache__/
+*.pyc

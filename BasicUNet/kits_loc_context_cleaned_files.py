@@ -676,7 +676,6 @@ if __name__ == "__main__":
                             out_channels=num_classes,
                             features=(32, 32, 64, 128, 256, 32),
                             dropout=0.1,
-                            hanet_params=None,
                             LocBAM_params=None,
                         )
                 else:
