@@ -280,7 +280,7 @@ class ReconstructCoordinateChannels(MapTransform):
             # print(coord_x.shape, coord_y.shape, coord_z.shape)
             # Stack coordinate channels back into the full tensor
             full_tensor = torch.cat(
-                [ct_image, coord_z.unsqueeze(0), coord_x.unsqueeze(0), coord_y.unsqueeze(0)],
+                [ct_image, coord_x.unsqueeze(0), coord_y.unsqueeze(0), coord_z.unsqueeze(0)],
                 dim=0
             )
             # print(full_tensor.shape)
@@ -340,7 +340,7 @@ if __name__ == "__main__":
                 ),
                 ConcatChannelsd(keys=["image_ct", "image_bpr"], output_key="image"),
 
-                CropForegroundd(keys=["image", "label"], source_key="image"),
+                CropForegroundd(keys=["image", "label"], source_key="image", channel_indices=0),
                 Orientationd(keys=["image", "label"], axcodes="RAS"),
                 Spacingd(
                     keys=["image", "label"],
@@ -424,7 +424,7 @@ if __name__ == "__main__":
                 ConcatChannelsd(keys=["image_ct", "image_bpr"], output_key="image"),
 
 
-                CropForegroundd(keys=["image", "label"], source_key="image", allow_smaller=False),
+                CropForegroundd(keys=["image", "label"], source_key="image", channel_indices=0, allow_smaller=False),
                 Orientationd(keys=["image", "label"], axcodes="RAS"),
                 Spacingd(
                     keys=["image", "label"],

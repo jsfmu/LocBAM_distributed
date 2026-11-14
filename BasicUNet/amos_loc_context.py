@@ -307,8 +307,41 @@ if __name__ == "__main__":
     parser.add_argument("-fold", type=int, choices=[0,1,2,3,4])
     parser.add_argument("-strategy", choices=["Baseline", "XYZ", "LocBAM"])
     parser.add_argument("-ps", choices=["small", "large"])
+    parser.add_argument("-iters", type=int, default=250000)
+    parser.add_argument("-seed", type=int, default=1234)
+    parser.add_argument("-data_dir", default="/vol/nasciam/datasets/amos_bpr/",
+                        help="folder holding the AMOS+BPR images and dataset_cluster_<fold>.json")
+    parser.add_argument("-cache_dir", default="/vol/ciamspace/datasets/amos_bpr/cache",
+                        help="PersistentDataset cache; delete it whenever the deterministic transforms change")
 
     args = parser.parse_args()
+
+    # Multi-GPU (DDP) setup. Launched with torchrun, every process gets RANK/LOCAL_RANK/WORLD_SIZE;
+    # launched with plain `python`, this falls back to a single process and nothing else changes.
+    import datetime
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    from monai.data import partition_dataset
+    from monai.metrics.utils import do_metric_reduction
+
+    if "RANK" in os.environ:
+        dist.init_process_group("nccl" if dist.is_nccl_available() else "gloo",
+                                timeout=datetime.timedelta(hours=6))  # other ranks wait while rank 0 runs the full validation
+        rank, local_rank, world_size = dist.get_rank(), int(os.environ["LOCAL_RANK"]), dist.get_world_size()
+        # One GPU per process normally; the modulo only matters when testing more processes than GPUs (gloo).
+        local_rank = local_rank % torch.cuda.device_count()
+        torch.cuda.set_device(local_rank)
+    else:
+        rank, local_rank, world_size = 0, 0, 1
+    is_main = rank == 0
+
+    class _NullWriter:
+        """Stands in for SummaryWriter on ranks other than 0, so only one process logs."""
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    from monai.utils import set_determinism
+    set_determinism(seed=args.seed + rank)  # each rank draws different random patches
 
     dtype = [np.float16, np.int8]
     
@@ -437,7 +470,7 @@ if __name__ == "__main__":
                 ConcatChannelsd(keys=["image_ct", "image_bpr"], output_key="image"),
 
 
-                CropForegroundd(keys=["image", "label"], source_key="image", channel_indices=0),
+                CropForegroundd(keys=["image", "label"], source_key="image", channel_indices=0, allow_smaller=False),
                 Orientationd(keys=["image", "label"], axcodes="RAS"),
                 Spacingd(
                     keys=["image", "label"],
@@ -470,19 +503,24 @@ if __name__ == "__main__":
     def build_dataset(current_patch_size, sample_batch_size, crop_batch_size, fold_idx, sampling):
        
         # data_dir = "/vol/nasciam/datasets/btcv/" 
-        data_dir = "/vol/nasciam/datasets/amos_bpr/" # <-- CHANGE THIS TO YOUR LOCAL DATA LOCATION
+        data_dir = args.data_dir  # set with -data_dir
 
-            # copy to aims cluster 
-        
+            # copy to aims cluster
+
         split_json = "dataset_cluster_" + str(fold_idx) + ".json"
 
-        datasets = data_dir + split_json
+        datasets = os.path.join(data_dir, split_json)
         datalist = load_decathlon_datalist(datasets, True, "training")
         val_files = load_decathlon_datalist(datasets, True, "validation")
         cache_rate = 1.0
 
-        
-        cache_dir = "/vol/ciamspace/datasets/amos_bpr/cache" # <-- CHANGE THIS TO YOUR LOCAL DATA LOCATION
+        # Under DDP each rank trains on its own disjoint shard of the training cases.
+        # Validation stays whole: only rank 0 validates.
+        if world_size > 1:
+            datalist = partition_dataset(datalist, num_partitions=world_size, shuffle=True,
+                                         seed=args.seed, even_divisible=True)[rank]
+
+        cache_dir = args.cache_dir  # set with -cache_dir
         if False:
             train_ds = CacheDataset(
                 data=datalist,
@@ -544,14 +582,16 @@ if __name__ == "__main__":
 
 
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
 
     def validation(epoch_iterator_val, patch_size, batch_size, sampling, max_samples=None):
-        model.eval()
+        # Uses the unwrapped `net`: calling the DDP wrapper on rank 0 alone would hang the other ranks.
+        net.eval()
         dice_metric.reset()
 
         sample_count = 0  # Track number of samples processed
+        batch_scores = []  # per-batch Dice, reduced locally below
 
         with torch.no_grad():
             for batch in epoch_iterator_val:
@@ -563,7 +603,7 @@ if __name__ == "__main__":
 
                 # Run inference
                 with torch.cuda.amp.autocast():
-                    val_outputs = sliding_window_inference(val_inputs, patch_size, batch_size, model,
+                    val_outputs = sliding_window_inference(val_inputs, patch_size, batch_size, net,
                                                            device=torch.device("cpu"))
 
                 # Compute Dice metric
@@ -571,7 +611,7 @@ if __name__ == "__main__":
                 val_labels_convert = [post_label(val_label_tensor.cpu()) for val_label_tensor in val_labels_list]
                 val_outputs_list = decollate_batch(val_outputs)
                 val_output_convert = [post_pred(val_pred_tensor.cpu()) for val_pred_tensor in val_outputs_list]
-                dice_metric(y_pred=val_output_convert, y=val_labels_convert)
+                batch_scores.append(dice_metric(y_pred=val_output_convert, y=val_labels_convert))
 
                 sample_count += len(val_inputs)  # Track how many samples were processed
 
@@ -579,7 +619,9 @@ if __name__ == "__main__":
                 if max_samples is not None and sample_count >= max_samples:
                     break
 
-            mean_dice_val = dice_metric.aggregate().item()
+            # dice_metric.aggregate() all-gathers across ranks once torch.distributed is initialised,
+            # which hangs because only rank 0 validates. Same reduction as aggregate(), done locally.
+            mean_dice_val = do_metric_reduction(torch.cat(batch_scores), dice_metric.reduction)[0].item()
             dice_metric.reset()
 
         return mean_dice_val
@@ -634,11 +676,17 @@ if __name__ == "__main__":
                     effective_batch_size = 2
 
                 else:
-                    print("No patch size selected") 
+                    print("No patch size selected")
                     # Calculate the number of parameters
 
+                # Keep the GLOBAL batch equal to the paper's (128 small / 2 large); each GPU takes its share.
+                if effective_batch_size % world_size != 0:
+                    raise ValueError(f"effective_batch_size {effective_batch_size} is not divisible by "
+                                     f"{world_size} GPUs; the large-patch setting supports at most 2.")
+                effective_batch_size //= world_size
+
                 # max_iterations = 250000 #number of training iterations
-                max_iterations = 250000
+                max_iterations = args.iters
                 eval_num = max_iterations // 20 #when to trigger evaluation during training
 
                 new_lr = 1e-2
@@ -649,7 +697,6 @@ if __name__ == "__main__":
                             out_channels=num_classes,
                             features=(32, 32, 64, 128, 256, 32),
                             dropout=0.1,
-                            use_bpr=True,
                         )
                 else:
                     model = BasicUNet(spatial_dims=3, 
@@ -668,14 +715,20 @@ if __name__ == "__main__":
                 # print("Total num of parameters " + str(pytorch_total_params))
 
                 model = model.to(device)
-                model = torch.compile(model)
+                net = model  # unwrapped model: used for validation and saving (no "module."/"_orig_mod." key prefixes)
+                if world_size > 1:
+                    # find_unused_parameters: BasicUnetLocBAMs2 keeps unet.final_conv but never calls it
+                    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+                elif os.name != "nt":  # torch.compile needs Triton (not on Windows); left off under DDP for now
+                    model = torch.compile(model)
 
                 ### train
-                writer = SummaryWriter()
-                logdir = writer.get_logdir() #wha tis logdir in cluster
+                writer = SummaryWriter() if is_main else _NullWriter()
+                logdir = writer.get_logdir() if is_main else None #wha tis logdir in cluster
                 # logdir = "/vol/nasciam/users/hodo/Documents/Cluster/runs"
-                print(logdir)
-                shutil.copy2(__file__, logdir)
+                if is_main:
+                    print(logdir)
+                    shutil.copy2(__file__, logdir)
 
                 # Inter sample cropping (sample>=2, crops_per_sample>=1)
                 if effective_batch_size > max_sample_size:
@@ -697,7 +750,8 @@ if __name__ == "__main__":
 
                     model.train()
                     epoch_loss = 0
-                    epoch_iterator = tqdm(train_loader, desc="Training (X / X Steps) (loss=X.X)", dynamic_ncols=True)
+                    epoch_iterator = tqdm(train_loader, desc="Training (X / X Steps) (loss=X.X)", dynamic_ncols=True,
+                                          disable=not is_main)
                     for step, batch in enumerate(epoch_iterator):
                         global_step += 1
                         if global_step >= max_iterations:
@@ -762,23 +816,27 @@ if __name__ == "__main__":
                         writer.add_scalar("Patchsize/train", patch_size[0], global_step)
 
                         if (global_step % eval_num == 0 and global_step != 0):
-                            epoch_iterator_val = tqdm(val_loader, desc="Validate (X / X Steps) (dice=X.X)", dynamic_ncols=True)
-                            
-                            # Validate only on 10 samples for intermediate steps
-                            dice_val = validation(epoch_iterator_val, patch_size, effective_batch_size, sampling, max_samples=10)
+                            if is_main:  # only rank 0 validates
+                                epoch_iterator_val = tqdm(val_loader, desc="Validate (X / X Steps) (dice=X.X)", dynamic_ncols=True)
 
-                            epoch_loss /= step
-                            epoch_loss_values.append(epoch_loss)
-                            metric_values.append(dice_val)
+                                # Validate only on 10 samples for intermediate steps
+                                dice_val = validation(epoch_iterator_val, patch_size, effective_batch_size, sampling, max_samples=10)
 
-                            writer.add_scalar("Loss/val", epoch_loss, global_step)
-                            writer.add_scalar("Dice/val", dice_val, global_step)
+                                epoch_loss /= step
+                                epoch_loss_values.append(epoch_loss)
+                                metric_values.append(dice_val)
+
+                                writer.add_scalar("Loss/val", epoch_loss, global_step)
+                                writer.add_scalar("Dice/val", dice_val, global_step)
+                            if world_size > 1:
+                                dist.barrier()  # other ranks wait here until rank 0 has validated
+                            model.train()  # validation() switched the model to eval mode
 
                         # if global_step % 1000 == 0:  # Update cache less often
                         #     train_ds.update_cache() 
 
                         # Final validation step (on the full dataset)
-                        if global_step == max_iterations:
+                        if global_step == max_iterations and is_main:
                             epoch_iterator_val = tqdm(val_loader, desc="Validate (Final Full Dataset)", dynamic_ncols=True)
 
                             # Validate on **all** validation samples at the final step
@@ -796,7 +854,7 @@ if __name__ == "__main__":
                             if dice_val > dice_val_best:
                                 dice_val_best = dice_val
                                 global_step_best = global_step
-                                torch.save(model.state_dict(), os.path.join(root_dir, "best_metric_model.pth"))
+                                torch.save(net.state_dict(), os.path.join(root_dir, "best_metric_model.pth"))
                                 print(
                                     "Model Was Saved ! Current Best Avg. Dice: {} Current Avg. Dice: {}".format(dice_val_best, dice_val)
                                 )
@@ -814,31 +872,36 @@ if __name__ == "__main__":
                         break
 
 
-                epoch_iterator_val = tqdm(val_loader, desc="Validate (X / X Steps) (dice=X.X)", dynamic_ncols=True)
-                dice_val = validation(epoch_iterator_val, patch_size, effective_batch_size, sampling, max_samples=None)
+                if is_main:  # final full validation and checkpoints: rank 0 only
+                    epoch_iterator_val = tqdm(val_loader, desc="Validate (X / X Steps) (dice=X.X)", dynamic_ncols=True)
+                    dice_val = validation(epoch_iterator_val, patch_size, effective_batch_size, sampling, max_samples=None)
 
-                metric_values.append(dice_val)
-                writer.add_scalar("Dice/val", dice_val, global_step)
+                    metric_values.append(dice_val)
+                    writer.add_scalar("Dice/val", dice_val, global_step)
 
-                if dice_val > dice_val_best:
-                    dice_val_best = dice_val
-                    global_step_best = global_step
-                    torch.save(model.state_dict(), os.path.join(root_dir, "best_metric_model.pth"))
-                    print(
-                        "Model Was Saved ! Current Best Avg. Dice: {} Current Avg. Dice: {}".format(dice_val_best, dice_val)
-                    )
-                else:
-                    print(
-                        "Model Was Not Saved ! Current Best Avg. Dice: {} Current Avg. Dice: {}".format(
-                            dice_val_best, dice_val
+                    if dice_val > dice_val_best:
+                        dice_val_best = dice_val
+                        global_step_best = global_step
+                        torch.save(net.state_dict(), os.path.join(root_dir, "best_metric_model.pth"))
+                        print(
+                            "Model Was Saved ! Current Best Avg. Dice: {} Current Avg. Dice: {}".format(dice_val_best, dice_val)
                         )
-                    )
-                print(f"train completed, best_metric: {dice_val_best:.4f} " f"at iteration: {global_step_best}")
-                print(f"train completed, last_metric: {dice_val:.4f} " f"at iteration: {max_iterations}")
+                    else:
+                        print(
+                            "Model Was Not Saved ! Current Best Avg. Dice: {} Current Avg. Dice: {}".format(
+                                dice_val_best, dice_val
+                            )
+                        )
+                    print(f"train completed, best_metric: {dice_val_best:.4f} " f"at iteration: {global_step_best}")
+                    print(f"train completed, last_metric: {dice_val:.4f} " f"at iteration: {max_iterations}")
 
-                writer.flush()
-                writer.close()
-                performance_string = str(np.round(dice_val, decimals=4))
+                    writer.flush()
+                    writer.close()
+                    performance_string = str(np.round(dice_val, decimals=4))
 
-                # torch.save(model.state_dict(), os.path.join(logdir, "UNet_final_model_" + str(LocContext)+"_"+str(fold_idx) +".pth"))
-                torch.save(model.state_dict(), os.path.join(logdir, "iso_AMOS22_UNet_final_" + str(LocContext)+"_"+str(p_size)+"_"+str(fold_idx)  + "_" + str(performance_string) +".pth"))
+                    # torch.save(model.state_dict(), os.path.join(logdir, "UNet_final_model_" + str(LocContext)+"_"+str(fold_idx) +".pth"))
+                    torch.save(net.state_dict(), os.path.join(logdir, "iso_AMOS22_UNet_final_" + str(LocContext)+"_"+str(p_size)+"_"+str(fold_idx)  + "_" + str(performance_string) +".pth"))
+
+    if world_size > 1:
+        dist.barrier()  # keep other ranks alive until rank 0 has finished validating and saving
+        dist.destroy_process_group()
