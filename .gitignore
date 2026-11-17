@@ -5,3 +5,7 @@
 *.mhd
 *.nrrd
 *.dcm
+
+# Python bytecode caches
+__pycache__/
+*.pyc
